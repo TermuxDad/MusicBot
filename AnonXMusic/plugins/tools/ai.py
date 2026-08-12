@@ -1,4 +1,4 @@
-## ADDED AI FROM xbitcode api.
+## ADDED AI API.
 
 import requests
 import json
@@ -11,8 +11,8 @@ from pyrogram.errors import FloodWait
 from AnonXMusic import app ## make sure you use your own repo module name 
 from AnonXMusic.utils.database import get_model_settings
 from config import BANNED_USERS
-from config import YT_API_KEY as AI_KEY 
-from config import YTPROXY_URL as AI_ENDPOINT
+from config import WORKER_FALLBACK_API_KEY as AI_KEY
+from config import WORKER_FALLBACK_API_URL as AI_ENDPOINT
 import random
 import logging
 import asyncio
@@ -228,7 +228,7 @@ async def api_stats(client, message: Message):
     
     try:
         if not AI_ENDPOINT or not AI_KEY:
-            await handle_flood_wait(message.reply_text, "❌ Not using xBit API endpoint please contact @amjiddader.")
+            await handle_flood_wait(message.reply_text, "❌ API endpoint/key is not configured.")
             return
             
         status_msg = await handle_flood_wait(message.reply_text, "🔍 Checking API status...", quote=True)
