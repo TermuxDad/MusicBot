@@ -13,7 +13,7 @@ from AnonXMusic.utils import help_pannel
 from AnonXMusic.utils.database import get_lang, get_model_settings, update_model_settings
 from AnonXMusic.utils.decorators.language import LanguageStart, languageCB
 from AnonXMusic.utils.inline.help import help_back_markup, private_help_panel
-from config import BANNED_USERS, START_IMG_URL, SUPPORT_CHAT, YTPROXY_URL
+from config import BANNED_USERS, START_IMG_URL, SUPPORT_CHAT, WORKER_FALLBACK_API_URL
 import config
 from strings import get_string, helpers
 
@@ -22,7 +22,7 @@ async def fetch_tts_models():
     """Fetch TTS models from the API"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{YTPROXY_URL}/tts/models") as response:
+            async with session.get(f"{WORKER_FALLBACK_API_URL}/tts/models") as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("speakers", [])
@@ -36,7 +36,7 @@ async def fetch_image_models():
     """Fetch image models from the API"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{YTPROXY_URL}/image/models") as response:
+            async with session.get(f"{WORKER_FALLBACK_API_URL}/image/models") as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("models", [])
@@ -50,7 +50,7 @@ async def fetch_ai_models():
     """Fetch AI models from the API"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{YTPROXY_URL}/ai/models") as response:
+            async with session.get(f"{WORKER_FALLBACK_API_URL}/ai/models") as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("models", [])
@@ -163,7 +163,7 @@ async def helper_cb(client, CallbackQuery:CallbackQuery, _):
                 )
             ]
         ]
-        await CallbackQuery.edit_message_text(f"AI, TTS and Image Model Settings \n\n[Check Docs here]({YTPROXY_URL}/docs)", reply_markup=InlineKeyboardMarkup(btn),parse_mode=ParseMode.DEFAULT)
+        await CallbackQuery.edit_message_text(f"AI, TTS and Image Model Settings \n\n[Check Docs here]({WORKER_FALLBACK_API_URL}/docs)", reply_markup=InlineKeyboardMarkup(btn),parse_mode=ParseMode.DEFAULT)
     elif cb == "hb17":
         model_settings = await get_model_settings()
         current_tts = model_settings.get("tts", "athena")
