@@ -1,8 +1,10 @@
 import asyncio
 import glob
+import json
 import os
 import random
 import re
+import subprocess
 from typing import Union
 from urllib.parse import parse_qs, urlparse
 
@@ -111,29 +113,43 @@ class YouTubeAPI:
         return fallback
 
     def _extract_download_url(self, payload):
+        def is_media_url(value):
+            if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+                return False
+            lowered = value.lower()
+            return "youtube.com/watch" not in lowered and "youtu.be/" not in lowered
+
         def walk(value):
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
+            if is_media_url(value):
                 return value
             if isinstance(value, dict):
                 for key in (
-                    "audio_url",
-                    "audioUrl",
-                    "video_url",
-                    "videoUrl",
                     "directLink",
                     "directUrl",
                     "direct_url",
+                    "rawDirectLink",
                     "streamLink",
                     "streamUrl",
                     "stream_url",
                     "streamingUrl",
                     "streaming_url",
+                    "rawStreamingUrl",
+                    "raw_streaming_url",
                     "playbackUrl",
                     "playback_url",
+                    "workerLink",
+                    "relayLink",
+                    "proxyLink",
                     "downloads",
+                    "managedDownloadUrl",
+                    "managed_download_url",
                     "downloadUrl",
                     "download_url",
                     "download",
+                    "audio_url",
+                    "audioUrl",
+                    "video_url",
+                    "videoUrl",
                     "link",
                 ):
                     found = walk(value.get(key))
@@ -219,6 +235,37 @@ class YouTubeAPI:
         if cookie_file:
             options["cookiefile"] = cookie_file
         return options
+
+    def _file_has_audio(self, file_path: str):
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "json",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if probe.returncode != 0:
+                logger.warning(f"No readable audio stream found in {file_path}.")
+                return False
+            data = json.loads(probe.stdout or "{}")
+            return bool(data.get("streams"))
+        except FileNotFoundError:
+            logger.warning("ffprobe is not installed; skipping audio stream validation.")
+            return True
+        except Exception as exc:
+            logger.warning(f"Audio stream check failed for {file_path}: {exc}")
+            return False
 
 
     async def exists(self, link: str, videoid: Union[bool, str] = None):
@@ -587,6 +634,14 @@ class YouTubeAPI:
                 media_format,
             )
 
+        def remove_download_artifacts(filepath):
+            for candidate in glob.glob(f"{filepath}*"):
+                try:
+                    if os.path.isfile(candidate):
+                        os.remove(candidate)
+                except OSError:
+                    pass
+
         def download_from_youtube_sync(source_link, media_format, filepath):
             outtmpl = os.path.join("downloads", f"{vid_id}.%(ext)s")
             ydl_opts = {
@@ -631,8 +686,7 @@ class YouTubeAPI:
 
         async def download_from_youtube_fallback(source_link, media_format, filepath):
             try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
+                remove_download_artifacts(filepath)
                 return await loop.run_in_executor(
                     None,
                     download_from_youtube_sync,
@@ -663,18 +717,31 @@ class YouTubeAPI:
         async def video_dl(current_vid_id):
             filepath = os.path.join("downloads", f"{current_vid_id}.mp4")
             if os.path.exists(filepath):
-                return filepath
+                if self._file_has_audio(filepath):
+                    return filepath
+                logger.warning(f"Cached video for {current_vid_id} has no audio, redownloading.")
+                remove_download_artifacts(filepath)
 
             video_url = await get_worker_media_link(current_vid_id, "mp4")
             if video_url:
                 result = await download_from_source(video_url, filepath)
                 if result:
-                    return result
+                    if self._file_has_audio(result):
+                        return result
+                    logger.warning(
+                        f"Worker video for {current_vid_id} has no audio, trying yt-dlp fallback."
+                    )
+                    remove_download_artifacts(result)
 
             logger.warning(
                 f"Worker video API failed for {current_vid_id}, trying yt-dlp fallback."
             )
-            return await download_from_youtube_fallback(link, "mp4", filepath)
+            result = await download_from_youtube_fallback(link, "mp4", filepath)
+            if result and self._file_has_audio(result):
+                return result
+            if result:
+                remove_download_artifacts(result)
+            return None
 
         def song_video_dl():
             safe_title = self._safe_filename(title)
