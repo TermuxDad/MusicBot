@@ -1,11 +1,19 @@
 import os
 import re
 import math
+import asyncio
+import tempfile
 
 import aiofiles
 import aiohttp
-import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import (
+    Image,
+    ImageDraw,
+    ImageEnhance,
+    ImageFilter,
+    ImageFont,
+    ImageOps,
+)
 from unidecode import unidecode
 from ytSearch import VideosSearch
 
@@ -13,519 +21,1686 @@ from AnonXMusic import app
 from config import YOUTUBE_IMG_URL
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ============================================================
+# SETTINGS
+# ============================================================
 
-def changeImageSize(maxWidth, maxHeight, image):
-    widthRatio  = maxWidth  / image.size[0]
-    heightRatio = maxHeight / image.size[1]
-    newWidth    = int(widthRatio  * image.size[0])
-    newHeight   = int(heightRatio * image.size[1])
-    return image.resize((newWidth, newHeight), Image.LANCZOS)
+FINAL_SIZE = (1920, 1080)
+W, H = FINAL_SIZE
 
-
-def circle(img):
-    img = img.convert("RGBA")
-    h, w = img.size
-    mask = Image.new("L", (h, w), 0)
-    ImageDraw.Draw(mask).ellipse([(0, 0), (h, w)], fill=255)
-    result = Image.new("RGBA", (h, w), (0, 0, 0, 0))
-    result.paste(img, mask=mask)
-    return result
+BASE_W = 1280
+RATIO = W / BASE_W
 
 
-def clear(text, limit=45):
-    words, title = text.split(" "), ""
-    for w in words:
-        if len(title) + len(w) < limit:
-            title += " " + w
-    return title.strip()
+def S(value):
+    if isinstance(value, (tuple, list)):
+        return tuple(S(x) for x in value)
+    return int(round(value * RATIO))
 
 
-def get_dominant_color(img: Image.Image, n=4):
-    """Return most vibrant dominant colour via mini k-means."""
-    small = img.convert("RGB").resize((120, 120))
-    arr   = np.array(small).reshape(-1, 3).astype(float)
-    np.random.seed(42)
-    centers = arr[np.random.choice(len(arr), n, replace=False)]
-    for _ in range(12):
-        dists  = np.linalg.norm(arr[:, None] - centers[None], axis=2)
-        labels = np.argmin(dists, axis=1)
-        for k in range(n):
-            pts = arr[labels == k]
-            if len(pts):
-                centers[k] = pts.mean(axis=0)
-    best, best_sat = centers[0], 0
-    for c in centers:
-        r, g, b = c / 255.0
-        mx, mn  = max(r, g, b), min(r, g, b)
-        sat     = (mx - mn) / (mx + 1e-9)
-        lum     = (mx + mn) / 2
-        # prefer vibrant colours (high sat, mid luminance)
-        score   = sat * (1 - abs(lum - 0.5))
-        if score > best_sat:
-            best_sat, best = score, c
-    return tuple(int(x) for x in best)
+# ============================================================
+# LAYOUT - SECOND CODE STYLE
+# ============================================================
+
+CARD_BOX = S((90, 90, 610, 610))
+CARD_RADIUS = S(24)
+
+RIGHT_X = S(716)
+RIGHT_X_END = S(1200)
+
+TITLE_Y = S(149)
+SUBTITLE_Y = S(211)
+
+TOP_ICON_Y = S(168)
+TOP_ICON_R = S(24)
+
+STAR_ICON_X = S(1109)
+DOTS_ICON_X = S(1181)
+
+SEEK_Y = S(274)
+SEEK_THUMB_R = S(9)
+
+TIME_Y = S(314)
+
+PILL_CX = S(952)
+PILL_H = S(34)
+
+CONTROLS_Y = S(434)
+REWIND_X = S(791)
+PLAY_CX = S(952)
+FORWARD_X = S(1116)
+
+VOLUME_Y = S(553)
+
+VOL_SPEAKER_LOW_X = S(731)
+VOL_BAR_X0 = S(766)
+VOL_BAR_X1 = S(1138)
+VOL_SPEAKER_HIGH_X = S(1172)
+
+BOTTOM_ICON_Y = S(635)
+BOTTOM_ICON1_X = S(774)
+BOTTOM_ICON3_X = S(1131)
 
 
-def build_palette(base):
-    """
-    Always return ALL 10 neon colours in a visually pleasing rainbow cycle,
-    rotated so the colour closest to the song's dominant hue comes first.
-    This guarantees a true multi-colour rainbow ring every time regardless
-    of the song cover — not just warm or cool tones.
+# ============================================================
+# COLORS
+# ============================================================
 
-    The 10 neon colours (as specified):
-      Blue #1e90ff  Purple #a855f7  Rose #f43f5e  Amber #f59e0b
-      Teal #14b8a6  Green #22c55e   Orange #f97316 Pink #ec4899
-      Cyan #06b6d4  White #e2e8f0
-    """
-    # Fixed rainbow cycle order (visually flows blue→purple→rose→amber→teal etc.)
-    RAINBOW = [
-        (0x1e, 0x90, 0xff),   # Blue
-        (0x06, 0xb6, 0xd4),   # Cyan
-        (0x14, 0xb8, 0xa6),   # Teal
-        (0x22, 0xc5, 0x5e),   # Green
-        (0xf5, 0x9e, 0x0b),   # Amber
-        (0xf9, 0x73, 0x16),   # Orange
-        (0xf4, 0x3f, 0x5e),   # Rose
-        (0xec, 0x48, 0x99),   # Pink
-        (0xa8, 0x55, 0xf7),   # Purple
-        (0xe2, 0xe8, 0xf0),   # White
-    ]
-    br, bg, bb = base
+WHITE = (255, 255, 255)
+TITLE_COLOR = (255, 255, 255)
+SUBTITLE_COLOR = (222, 222, 222)
+MUTED = (185, 185, 185)
 
-    def dist(c):
-        return math.sqrt((c[0]-br)**2 * 0.299 + (c[1]-bg)**2 * 0.587 + (c[2]-bb)**2 * 0.114)
-
-    # Find the index of the closest colour in the rainbow
-    best_idx = min(range(len(RAINBOW)), key=lambda i: dist(RAINBOW[i]))
-
-    # Rotate the rainbow so the closest colour leads
-    rotated = RAINBOW[best_idx:] + RAINBOW[:best_idx]
-    return rotated  # all 10 colours, rainbow-ordered, dominant-first
+ACCENT_FALLBACK = (224, 176, 92)
 
 
-def make_neon_glow_border(size, bbox, dominant, radius=30, stroke=6, glow_layers=10):
-    """
-    Clean single-stroke neon border with soft glowing blur halo.
-    - One thin bright stroke at the bbox edge
-    - Multiple expanding faint layers behind it for the glow spread
-    - Colour comes from the song dominant, mapped to the closest neon hue
-    - Same function used for both outer card and centre rectangle ring
-    """
-    NEON = [
-        (0x1e, 0x90, 0xff),   # Blue
-        (0x06, 0xb6, 0xd4),   # Cyan
-        (0x14, 0xb8, 0xa6),   # Teal
-        (0x22, 0xc5, 0x5e),   # Green
-        (0xf5, 0x9e, 0x0b),   # Amber
-        (0xf9, 0x73, 0x16),   # Orange
-        (0xf4, 0x3f, 0x5e),   # Rose
-        (0xec, 0x48, 0x99),   # Pink
-        (0xa8, 0x55, 0xf7),   # Purple
-        (0xe2, 0xe8, 0xf0),   # White
-    ]
-    br, bg, bb = dominant
+# ============================================================
+# FILE HELPERS
+# ============================================================
 
-    def dist(c):
-        return math.sqrt((c[0]-br)**2*0.299 + (c[1]-bg)**2*0.587 + (c[2]-bb)**2*0.114)
-
-    # Pick the single closest neon hue — this IS the border colour
-    best = min(NEON, key=dist)
-    nr, ng, nb = best
-
-    # Secondary accent (second closest, for subtle glow variation)
-    sorted_neon = sorted(NEON, key=dist)
-    nr2, ng2, nb2 = sorted_neon[1]
-
-    layer = Image.new("RGBA", size, (0, 0, 0, 0))
-    x0, y0, x1, y1 = bbox
-    ld = ImageDraw.Draw(layer)
-
-    # ── Outer soft glow halo (wide, faint, expanding) ────────────────────────
-    for i in range(glow_layers, 0, -1):
-        t      = i / glow_layers
-        expand = int(t ** 0.5 * glow_layers * 4)   # spreads outward
-        alpha  = int(4 + (1 - t) ** 1.2 * 140)     # faint outside, brighter inside
-        w      = stroke + int(t * glow_layers * 2)
-        lx0    = max(0,       x0 - expand)
-        ly0    = max(0,       y0 - expand)
-        lx1    = min(size[0], x1 + expand)
-        ly1    = min(size[1], y1 + expand)
-        # alternate primary/secondary colour for subtle shimmer
-        cr, cg, cb = (nr, ng, nb) if i % 2 == 0 else (nr2, ng2, nb2)
-        ld.rounded_rectangle(
-            (lx0, ly0, lx1, ly1),
-            radius=max(6, radius - expand // 6),
-            outline=(cr, cg, cb, alpha),
-            width=w
+async def download_file(url, path):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
         )
+    }
 
-    # ── Bright inner glow (tight, vivid) ─────────────────────────────────────
-    for s in range(4, 0, -1):
-        alpha = 60 + s * 35
-        ld.rounded_rectangle(
-            (x0 - s, y0 - s, x1 + s, y1 + s),
-            radius=radius,
-            outline=(min(255, nr + 60), min(255, ng + 60), min(255, nb + 60), alpha),
-            width=stroke + s
-        )
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(
+            url,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
 
-    # ── Crisp primary stroke ──────────────────────────────────────────────────
-    ld.rounded_rectangle(
-        bbox, radius=radius,
-        outline=(min(255, nr + 90), min(255, ng + 90), min(255, nb + 90), 255),
-        width=stroke
-    )
+            if response.status != 200:
+                raise ValueError(
+                    f"Thumbnail download failed: HTTP {response.status}"
+                )
 
-    # ── White-hot centre line ─────────────────────────────────────────────────
-    ld.rounded_rectangle(
-        bbox, radius=radius,
-        outline=(255, 255, 255, 90),
-        width=max(1, stroke // 3)
-    )
+            data = await response.read()
 
-    return layer
+    def write_file():
+        with open(path, "wb") as f:
+            f.write(data)
+
+    await asyncio.to_thread(write_file)
 
 
-def draw_glowing_progress_bar(draw, canvas, x0, y0, x1, bar_h, thumb_frac, palette):
-    """
-    Draw a neon-glowing progress bar whose colour matches the border palette.
-    Includes soft glow behind the filled portion + bright thumb dot with glow.
-    """
-    # ── track background ──────────────────────────────────────────────────────
-    draw.rounded_rectangle(
-        [(x0, y0), (x1, y0 + bar_h)],
-        radius=bar_h // 2,
-        fill=(50, 50, 80, 160)
-    )
-
-    thumb_x = int(x0 + (x1 - x0) * thumb_frac)
-    base_col = palette[0]
-    accent   = palette[3]   # magenta-pink for contrast pop
-
-    # ── glow behind filled bar (soft, wide) ──────────────────────────────────
-    for glow in range(6, 0, -1):
-        gr, gg, gb = base_col
-        ga         = int(15 + (6 - glow) * 18)
-        gpad       = glow * 2
-        draw.rounded_rectangle(
-            [(x0, y0 - gpad // 2), (thumb_x, y0 + bar_h + gpad // 2)],
-            radius=bar_h // 2 + gpad // 2,
-            fill=(min(255, gr + 60), min(255, gg + 60), min(255, gb + 60), ga)
-        )
-
-    # ── filled (played) bar – gradient-like using two overlaid rects ─────────
-    r1, g1, b1 = base_col
-    r2, g2, b2 = accent
-    draw.rounded_rectangle(
-        [(x0, y0), (thumb_x, y0 + bar_h)],
-        radius=bar_h // 2,
-        fill=(min(255, r1 + 80), min(255, g1 + 80), min(255, b1 + 80), 240)
-    )
-    # thin bright top highlight stripe
-    draw.rounded_rectangle(
-        [(x0, y0), (thumb_x, y0 + bar_h // 3)],
-        radius=bar_h // 2,
-        fill=(min(255, r2 + 100), min(255, g2 + 100), min(255, b2 + 100), 120)
-    )
-
-    # ── thumb dot glow ────────────────────────────────────────────────────────
-    TR = 10
-    cy = y0 + bar_h // 2
-    for glow in range(5, 0, -1):
-        gr, gg, gb = accent
-        ga         = int(20 + (5 - glow) * 25)
-        gr_r       = TR + glow * 3
-        draw.ellipse(
-            [(thumb_x - gr_r, cy - gr_r), (thumb_x + gr_r, cy + gr_r)],
-            fill=(min(255, gr + 80), min(255, gg + 80), min(255, gb + 80), ga)
-        )
-    # solid bright dot
-    draw.ellipse(
-        [(thumb_x - TR, cy - TR), (thumb_x + TR, cy + TR)],
-        fill=(255, 255, 255, 250)
-    )
-    # inner coloured core
-    draw.ellipse(
-        [(thumb_x - TR + 3, cy - TR + 3), (thumb_x + TR - 3, cy + TR - 3)],
-        fill=(min(255, r2 + 100), min(255, g2 + 100), min(255, b2 + 100), 200)
-    )
-
-    return thumb_x
-
-
-# ── main function ─────────────────────────────────────────────────────────────
-
-async def get_thumb(videoid, user_id, title=None, duration=None, thumbnail=None,
-                    views=None, channel=None):
-    """
-    Generate a styled now-playing thumbnail.
-
-    Called as:
-      get_thumb(videoid, user_id)                            – auto-fetches details
-      get_thumb(videoid, user_id, title=, duration=, ...)   – uses provided details
-    """
-    if os.path.isfile(f"cache/{videoid}_{user_id}.png"):
-        return f"cache/{videoid}_{user_id}.png"
-
+def load_image(path):
     try:
-        # ── fetch song details if not already provided ────────────────────
-        if not title or not thumbnail:
-            url     = f"https://www.youtube.com/watch?v={videoid}"
-            results = VideosSearch(url, limit=1)
-            for result in (await results.next())["result"]:
-                try:
-                    title = result["title"]
-                    title = re.sub(r"\W+", " ", title).title()
-                except:
-                    title = "Unsupported Title"
-                try:
-                    duration = result["duration"]
-                except:
-                    duration = "Unknown"
-                thumbnail = result["thumbnails"][0]["url"].split("?")[0]
-                try:
-                    views = result["viewCount"]["short"]
-                except:
-                    views = "Unknown Views"
-                try:
-                    channel = result["channel"]["name"]
-                except:
-                    channel = "Unknown Channel"
-        else:
-            title    = re.sub(r"\W+", " ", str(title)).title()
-            duration = duration or "Unknown"
-            views    = views    or "Unknown Views"
-            channel  = channel  or "Unknown Channel"
+        return Image.open(path).convert("RGB")
+    except Exception:
+        return None
 
-        # ── download thumbnail ────────────────────────────────────────────
-        async with aiohttp.ClientSession() as session:
-            async with session.get(thumbnail) as resp:
-                if resp.status == 200:
-                    f = await aiofiles.open(f"cache/thumb{videoid}.png", mode="wb")
-                    await f.write(await resp.read())
-                    await f.close()
 
-        # ═════════════════════════════════════════════════════════════════
-        # WORK AT 2× RESOLUTION → downsample at end for anti-aliasing
-        # This gives much crisper text, borders and thumbnail quality.
-        # ═════════════════════════════════════════════════════════════════
-        SCALE    = 2
-        W, H     = 1280 * SCALE, 720 * SCALE
+# ============================================================
+# THUMBNAIL CLASS
+# ============================================================
 
-        # Layout (in full-res coords)
-        BOTTOM_H = 185 * SCALE    # taller bar (was 150)
-        CZ_H     = H - BOTTOM_H  # cover zone height
+class Thumbnail:
 
-        canvas = Image.new("RGBA", (W, H), (10, 6, 22, 255))
+    def __init__(self):
+        base = "AnonXMusic/assets"
 
-        # ── blurred cover background ──────────────────────────────────────
-        cover_raw = Image.open(f"cache/thumb{videoid}.png").convert("RGBA")
-        # Enhance the source image sharpness/colour before using it
-        cover_raw = ImageEnhance.Sharpness(cover_raw).enhance(1.4)
-        cover_raw = ImageEnhance.Color(cover_raw).enhance(1.3)
+        self.title_font_path = f"{base}/Poppins-ExtraBold.ttf"
+        self.subtitle_font_path = f"{base}/Raleway-Bold.ttf"
 
-        dominant  = get_dominant_color(cover_raw)
-        palette   = build_palette(dominant)
-        r_d, g_d, b_d = dominant
+        # Fallback fonts
+        if not os.path.exists(self.title_font_path):
+            self.title_font_path = f"{base}/font2.ttf"
 
-        cover_bg = cover_raw.resize((W, CZ_H), Image.LANCZOS).convert("RGBA")
-        cover_bg = cover_bg.filter(ImageFilter.GaussianBlur(28 * SCALE // 2))
-        cover_bg = Image.alpha_composite(
-            cover_bg, Image.new("RGBA", (W, CZ_H), (0, 0, 0, 140))
-        )
-        canvas.paste(cover_bg, (0, 0))
-
-        # gradient fade at bottom of cover zone
-        fade = Image.new("RGBA", (W, 130 * SCALE), (0, 0, 0, 0))
-        for row in range(130 * SCALE):
-            a = int((row / (130 * SCALE)) ** 1.5 * 240)
-            ImageDraw.Draw(fade).line([(0, row), (W, row)], fill=(10, 6, 22, a))
-        canvas.alpha_composite(fade, (0, CZ_H - 65 * SCALE))
-
-        # ── bottom bar ────────────────────────────────────────────────────
-        bar_r = max(0, r_d - 160)
-        bar_g = max(0, g_d - 160)
-        bar_b = max(0, b_d - 150)
-        bar   = Image.new("RGBA", (W, BOTTOM_H + 20 * SCALE), (bar_r, bar_g, bar_b, 240))
-        bar   = Image.alpha_composite(
-            bar, Image.new("RGBA", (W, BOTTOM_H + 20 * SCALE), (0, 0, 0, 80))
-        )
-        canvas.alpha_composite(bar, (0, CZ_H - 16 * SCALE))
-
-        # ── centre cover art – bigger, nudged down into centre of cover zone ──
-        CV_W    = 390 * SCALE   # wider (was 340)
-        CV_H    = 320 * SCALE   # taller (was 280)
-        CV_LEFT = (W - CV_W) // 2
-        # +30*SCALE moves it down from the zone midpoint toward the bar
-        CV_TOP  = (CZ_H - CV_H) // 2 + 30 * SCALE
-
-        cover_sq = cover_raw.resize((CV_W, CV_H), Image.LANCZOS).convert("RGBA")
-        # Extra sharpness on the displayed cover
-        cover_sq = ImageEnhance.Sharpness(cover_sq).enhance(1.5)
-        cover_sq = ImageEnhance.Contrast(cover_sq).enhance(1.1)
-        rc_mask  = Image.new("L", (CV_W, CV_H), 0)
-        ImageDraw.Draw(rc_mask).rounded_rectangle(
-            [(0, 0), (CV_W, CV_H)], radius=22 * SCALE, fill=255
-        )
-        cover_sq.putalpha(rc_mask)
-
-        # drop shadow
-        sh_w, sh_h = CV_W + 80 * SCALE, CV_H + 80 * SCALE
-        shadow     = Image.new("RGBA", (sh_w, sh_h), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).rounded_rectangle(
-            [(24 * SCALE, 24 * SCALE), (sh_w - 24 * SCALE, sh_h - 24 * SCALE)],
-            radius=30 * SCALE, fill=(r_d // 2, g_d // 2, b_d // 2, 180)
-        )
-        shadow = shadow.filter(ImageFilter.GaussianBlur(22 * SCALE // 2))
-        canvas.alpha_composite(shadow, (CV_LEFT - 40 * SCALE, CV_TOP - 40 * SCALE))
-        canvas.alpha_composite(cover_sq, (CV_LEFT, CV_TOP))
-
-        # neon ring around cover art — same colour as outer border
-        ring_pad   = 10 * SCALE
-        ring_layer = make_neon_glow_border(
-            (W, H),
-            (CV_LEFT - ring_pad, CV_TOP - ring_pad,
-             CV_LEFT + CV_W + ring_pad, CV_TOP + CV_H + ring_pad),
-            dominant, radius=28 * SCALE, stroke=5 * SCALE, glow_layers=10
-        )
-        canvas.alpha_composite(ring_layer)
-
-        # ── outer card border – thin glowing neon, colour from song ──────────
-        border_layer = make_neon_glow_border(
-            (W, H), (6 * SCALE, 6 * SCALE, W - 6 * SCALE, H - 6 * SCALE),
-            dominant, radius=30 * SCALE, stroke=5 * SCALE, glow_layers=12
-        )
-        canvas.alpha_composite(border_layer)
-
-        # ── "NOW PLAYING" badge (top-left) ───────────────────────────────
-        BW, BH = 210 * SCALE, 42 * SCALE
-        badge  = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
-        p0     = palette[0]
-        ImageDraw.Draw(badge).rounded_rectangle(
-            [(0, 0), (BW, BH)],
-            radius=BH // 2,
-            fill=(max(0, p0[0] - 80), max(0, p0[1] - 80), max(0, p0[2] - 80), 210),
-            outline=(min(255, p0[0] + 100), min(255, p0[1] + 100), min(255, p0[2] + 100), 220),
-            width=3 * SCALE // 2
-        )
-        canvas.alpha_composite(badge, (28 * SCALE, 26 * SCALE))
-
-        # ── Bot name badge (top-right, same style & height) ───────────────
-        bot_name  = unidecode(app.name)[:18]   # truncate if very long
-        # measure text width to size the badge dynamically
-        try:
-            font_badge_tmp = ImageFont.truetype("AnonXMusic/assets/font2.ttf", 18 * SCALE)
-            txt_w = font_badge_tmp.getlength(bot_name)
-        except:
-            txt_w = len(bot_name) * 11 * SCALE
-        RBW = int(txt_w) + 36 * SCALE   # padding on each side
-        RBH = BH
-        rbadge = Image.new("RGBA", (RBW, RBH), (0, 0, 0, 0))
-        ImageDraw.Draw(rbadge).rounded_rectangle(
-            [(0, 0), (RBW, RBH)],
-            radius=RBH // 2,
-            fill=(max(0, p0[0] - 80), max(0, p0[1] - 80), max(0, p0[2] - 80), 210),
-            outline=(min(255, p0[0] + 100), min(255, p0[1] + 100), min(255, p0[2] + 100), 220),
-            width=3 * SCALE // 2
-        )
-        # Place at same Y as NOW PLAYING badge, flush to right edge
-        RB_X = W - RBW - 28 * SCALE
-        RB_Y = 26 * SCALE
-        canvas.alpha_composite(rbadge, (RB_X, RB_Y))
-
-        # ── fonts (scaled) ────────────────────────────────────────────────
-        try:
-            font_bold  = ImageFont.truetype("AnonXMusic/assets/font2.ttf", 32 * SCALE)
-            font_badge = ImageFont.truetype("AnonXMusic/assets/font2.ttf", 18 * SCALE)
-            font_small = ImageFont.truetype("AnonXMusic/assets/font.ttf",  24 * SCALE)
-            font_dur   = ImageFont.truetype("AnonXMusic/assets/font.ttf",  22 * SCALE)
-        except:
-            font_bold = font_badge = font_small = font_dur = ImageFont.load_default()
-
-        draw = ImageDraw.Draw(canvas)
-
-        # badge texts
-        draw.text(
-            (48 * SCALE, 34 * SCALE),
-            "NOW PLAYING",
-            fill=(230, 235, 255, 245),
-            font=font_badge
-        )
-        # bot name badge text — centred inside the right badge
-        draw.text(
-            (RB_X + 18 * SCALE, RB_Y + (RBH - font_badge.size) // 2),
-            bot_name,
-            fill=(230, 235, 255, 245),
-            font=font_badge
-        )
-
-        # ═══════════════════════════════════════════════════════════════════
-        # BOTTOM BAR (taller = more breathing room)
-        #
-        #  [icon]  Song Title (bold, large)
-        #          Played by: BotName  ·  Channel
-        #          ════════════════●═══════════════
-        #          00:00                      4:29
-        # ═══════════════════════════════════════════════════════════════════
-        BAR_Y     = CZ_H - 16 * SCALE
-        IS        = 118 * SCALE   # icon size
-        ICON_X    = 52 * SCALE    # shifted right (was 24) for better alignment
-        ICON_Y    = BAR_Y + (BOTTOM_H - IS) // 2
-
-        # icon
-        icon_img = cover_raw.resize((IS, IS), Image.LANCZOS).convert("RGBA")
-        icon_img = ImageEnhance.Sharpness(icon_img).enhance(1.3)
-        ic_mask  = Image.new("L", (IS, IS), 0)
-        ImageDraw.Draw(ic_mask).rounded_rectangle(
-            [(0, 0), (IS, IS)], radius=16 * SCALE, fill=255
-        )
-        icon_img.putalpha(ic_mask)
-        canvas.alpha_composite(icon_img, (ICON_X, ICON_Y))
-
-        # text columns
-        TEXT_X  = ICON_X + IS + 22 * SCALE
-        LINE1_Y = BAR_Y + 16 * SCALE                          # title
-        LINE2_Y = BAR_Y + 16 * SCALE + 38 * SCALE            # subtitle
-
-        draw.text((TEXT_X, LINE1_Y), clear(title, 40),
-                  fill=(255, 255, 255, 250), font=font_bold)
-        draw.text(
-            (TEXT_X, LINE2_Y),
-            f"Played by: {unidecode(app.name)}  ·  {channel[:32]}",
-            fill=(175, 180, 215, 195),
-            font=font_small
-        )
-
-        # ── progress bar (colour-matched to border palette) ───────────────
-        PROG_X0  = TEXT_X
-        PROG_X1  = W - 32 * SCALE
-        BAR_H_PX = 8 * SCALE
-        PROG_Y   = BAR_Y + BOTTOM_H - 52 * SCALE   # neat gap from bar bottom
-        TIME_Y   = PROG_Y + BAR_H_PX + 8 * SCALE
-
-        draw_glowing_progress_bar(
-            draw, canvas,
-            PROG_X0, PROG_Y, PROG_X1, BAR_H_PX,
-            thumb_frac=0.65,
-            palette=palette
-        )
-
-        # time labels – same Y, anchored to bar edges
-        draw.text((PROG_X0,          TIME_Y), "00:00",       fill=(195, 200, 230, 210), font=font_dur)
-        draw.text((PROG_X1 - 74 * SCALE, TIME_Y), duration[:7], fill=(195, 200, 230, 210), font=font_dur)
-
-        # ── downsample to final 1280×720 for crisp anti-aliased output ────
-        final = canvas.convert("RGB").resize((1280, 720), Image.LANCZOS)
+        if not os.path.exists(self.subtitle_font_path):
+            self.subtitle_font_path = f"{base}/font.ttf"
 
         try:
-            os.remove(f"cache/thumb{videoid}.png")
-        except:
+            self.font_subtitle = ImageFont.truetype(
+                self.subtitle_font_path,
+                S(24),
+            )
+            self.font_time = ImageFont.truetype(
+                self.subtitle_font_path,
+                S(20),
+            )
+            self.font_pill = ImageFont.truetype(
+                self.subtitle_font_path,
+                S(17),
+            )
+        except Exception:
+            self.font_subtitle = ImageFont.load_default()
+            self.font_time = ImageFont.load_default()
+            self.font_pill = ImageFont.load_default()
+
+
+    # ========================================================
+    # BASIC HELPERS
+    # ========================================================
+
+    def fit_image(self, image, size):
+        return ImageOps.fit(
+            image,
+            size,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+
+
+    def round_image(self, image, radius):
+        image = image.convert("RGBA")
+
+        w, h = image.size
+
+        mask = Image.new("L", (w, h), 0)
+
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, w, h),
+            radius=radius,
+            fill=255,
+        )
+
+        result = Image.new(
+            "RGBA",
+            (w, h),
+            (0, 0, 0, 0),
+        )
+
+        result.paste(
+            image,
+            (0, 0),
+            mask,
+        )
+
+        return result
+
+
+    def truncate(self, text, limit):
+        text = str(text or "")
+
+        if len(text) <= limit:
+            return text
+
+        return text[:limit - 3] + "..."
+
+
+    def fit_title(self, draw, text, max_width):
+        text = self.truncate(text, 50)
+
+        size = S(46)
+
+        while size >= S(24):
+
+            try:
+                font = ImageFont.truetype(
+                    self.title_font_path,
+                    size,
+                )
+            except Exception:
+                font = ImageFont.load_default()
+
+            box = draw.textbbox(
+                (0, 0),
+                text,
+                font=font,
+            )
+
+            if box[2] - box[0] <= max_width:
+                return text, font
+
+            size -= S(2)
+
+        return self.truncate(text, 30), font
+
+
+    # ========================================================
+    # DURATION
+    # ========================================================
+
+    @staticmethod
+    def parse_duration(value):
+
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        if isinstance(value, str):
+
+            value = value.strip()
+
+            if ":" in value:
+
+                try:
+                    parts = [
+                        int(x)
+                        for x in value.split(":")
+                    ]
+                except Exception:
+                    return None
+
+                seconds = 0
+
+                for part in parts:
+                    seconds = seconds * 60 + part
+
+                return float(seconds)
+
+            try:
+                return float(value)
+
+            except Exception:
+                return None
+
+        return None
+
+
+    @staticmethod
+    def format_time(seconds):
+
+        if seconds is None:
+            return None
+
+        seconds = max(0, int(seconds))
+
+        minutes, secs = divmod(seconds, 60)
+
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+
+        return f"{minutes}:{secs:02d}"
+
+
+    # ========================================================
+    # ACCENT COLOR
+    # ========================================================
+
+    def get_accent(self, image):
+
+        try:
+            small = image.convert("RGB").resize(
+                (60, 60),
+                Image.Resampling.BILINEAR,
+            )
+
+            colors = small.getcolors(60 * 60)
+
+            if colors:
+
+                colors.sort(
+                    key=lambda x: x[0],
+                    reverse=True,
+                )
+
+                color = colors[0][1]
+
+                r, g, b = color
+
+                # Make it brighter and more visible
+                maximum = max(r, g, b)
+                minimum = min(r, g, b)
+
+                if maximum - minimum < 35:
+                    return ACCENT_FALLBACK
+
+                factor = 1.25
+
+                r = min(255, int(r * factor))
+                g = min(255, int(g * factor))
+                b = min(255, int(b * factor))
+
+                return (r, g, b)
+
+        except Exception:
             pass
 
-        final.save(f"cache/{videoid}_{user_id}.png", quality=97, optimize=False)
-        return f"cache/{videoid}_{user_id}.png"
+        return ACCENT_FALLBACK
 
-    except Exception:
+
+    # ========================================================
+    # BACKGROUND
+    # ========================================================
+
+    def build_background(self, cover):
+
+        cover = cover.convert("RGB")
+
+        zoom_size = (
+            int(W * 1.25),
+            int(H * 1.25),
+        )
+
+        zoomed = ImageOps.fit(
+            cover,
+            zoom_size,
+            method=Image.Resampling.LANCZOS,
+        )
+
+        left = (zoom_size[0] - W) // 2
+        top = (zoom_size[1] - H) // 2
+
+        background = zoomed.crop(
+            (
+                left,
+                top,
+                left + W,
+                top + H,
+            )
+        )
+
+        zoomed.close()
+
+        # Strong blur
+        small = background.resize(
+            (
+                max(1, W // 5),
+                max(1, H // 5),
+            ),
+            Image.Resampling.BILINEAR,
+        )
+
+        background.close()
+
+        background = small.resize(
+            FINAL_SIZE,
+            Image.Resampling.BILINEAR,
+        )
+
+        small.close()
+
+        background = background.filter(
+            ImageFilter.GaussianBlur(S(20))
+        )
+
+        background = ImageEnhance.Color(
+            background
+        ).enhance(1.12)
+
+        background = ImageEnhance.Contrast(
+            background
+        ).enhance(1.05)
+
+        background = ImageEnhance.Brightness(
+            background
+        ).enhance(0.72)
+
+        background = background.convert("RGBA")
+
+        # Dark overlay
+        dark = Image.new(
+            "RGBA",
+            FINAL_SIZE,
+            (0, 0, 0, 120),
+        )
+
+        background.alpha_composite(dark)
+
+        # Extra dark area on right
+        right_dark = Image.new(
+            "RGBA",
+            FINAL_SIZE,
+            (5, 5, 8, 0),
+        )
+
+        rd = ImageDraw.Draw(
+            right_dark,
+            "RGBA",
+        )
+
+        rd.rectangle(
+            (
+                S(600),
+                0,
+                W,
+                H,
+            ),
+            fill=(5, 5, 8, 100),
+        )
+
+        right_dark = right_dark.filter(
+            ImageFilter.GaussianBlur(S(40))
+        )
+
+        background.alpha_composite(right_dark)
+
+        return background
+
+
+    # ========================================================
+    # CARD GLOW
+    # ========================================================
+
+    def draw_card_glow(self, canvas, accent):
+
+        x0, y0, x1, y1 = CARD_BOX
+
+        glow = Image.new(
+            "RGBA",
+            FINAL_SIZE,
+            (0, 0, 0, 0),
+        )
+
+        gd = ImageDraw.Draw(
+            glow,
+            "RGBA",
+        )
+
+        gd.rounded_rectangle(
+            (
+                x0 - S(20),
+                y0 - S(20),
+                x1 + S(20),
+                y1 + S(20),
+            ),
+            radius=CARD_RADIUS + S(20),
+            outline=(
+                accent[0],
+                accent[1],
+                accent[2],
+                130,
+            ),
+            width=S(20),
+        )
+
+        glow = glow.filter(
+            ImageFilter.GaussianBlur(S(35))
+        )
+
+        # Keep glow only around left card
+        mask = Image.new(
+            "L",
+            FINAL_SIZE,
+            0,
+        )
+
+        ImageDraw.Draw(mask).rectangle(
+            (
+                0,
+                0,
+                RIGHT_X - S(40),
+                H,
+            ),
+            fill=255,
+        )
+
+        alpha = glow.getchannel("A")
+
+        glow.putalpha(
+            Image.composite(
+                alpha,
+                Image.new("L", FINAL_SIZE, 0),
+                mask,
+            )
+        )
+
+        canvas.alpha_composite(glow)
+
+
+    # ========================================================
+    # POSTER CARD
+    # ========================================================
+
+    def draw_poster_card(
+        self,
+        canvas,
+        cover,
+        accent,
+    ):
+
+        self.draw_card_glow(
+            canvas,
+            accent,
+        )
+
+        x0, y0, x1, y1 = CARD_BOX
+
+        width = x1 - x0
+        height = y1 - y0
+
+        # Shadow
+        shadow = Image.new(
+            "RGBA",
+            FINAL_SIZE,
+            (0, 0, 0, 0),
+        )
+
+        ImageDraw.Draw(
+            shadow
+        ).rounded_rectangle(
+            (
+                x0 + S(8),
+                y0 + S(20),
+                x1 + S(8),
+                y1 + S(20),
+            ),
+            radius=CARD_RADIUS,
+            fill=(0, 0, 0, 170),
+        )
+
+        shadow = shadow.filter(
+            ImageFilter.GaussianBlur(S(28))
+        )
+
+        canvas.alpha_composite(
+            shadow
+        )
+
+        # Cover
+        art = self.fit_image(
+            cover,
+            (width, height),
+        ).convert("RGBA")
+
+        art = ImageEnhance.Sharpness(
+            art
+        ).enhance(1.25)
+
+        art = ImageEnhance.Color(
+            art
+        ).enhance(1.10)
+
+        # Slight dark edge
+        shade = Image.new(
+            "RGBA",
+            (width, height),
+            (0, 0, 0, 0),
+        )
+
+        sd = ImageDraw.Draw(
+            shade,
+            "RGBA",
+        )
+
+        sd.rectangle(
+            (0, 0, width, S(80)),
+            fill=(0, 0, 0, 45),
+        )
+
+        sd.rectangle(
+            (
+                0,
+                height - S(80),
+                width,
+                height,
+            ),
+            fill=(0, 0, 0, 45),
+        )
+
+        art.alpha_composite(
+            shade
+        )
+
+        art = self.round_image(
+            art,
+            CARD_RADIUS,
+        )
+
+        # Border
+        border = Image.new(
+            "RGBA",
+            (width, height),
+            (0, 0, 0, 0),
+        )
+
+        ImageDraw.Draw(
+            border
+        ).rounded_rectangle(
+            (
+                0,
+                0,
+                width - 1,
+                height - 1,
+            ),
+            radius=CARD_RADIUS,
+            outline=(
+                255,
+                255,
+                255,
+                100,
+            ),
+            width=S(2),
+        )
+
+        art.alpha_composite(
+            border
+        )
+
+        canvas.alpha_composite(
+            art,
+            (x0, y0),
+        )
+
+
+    # ========================================================
+    # TOP ICONS
+    # ========================================================
+
+    def icon_circle(
+        self,
+        canvas,
+        cx,
+        cy,
+        radius,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        draw.ellipse(
+            (
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
+            ),
+            fill=(40, 38, 38, 170),
+            outline=(255, 255, 255, 150),
+            width=S(1),
+        )
+
+
+    def draw_star(
+        self,
+        canvas,
+        cx,
+        cy,
+        radius,
+    ):
+
+        self.icon_circle(
+            canvas,
+            cx,
+            cy,
+            radius,
+        )
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        points = []
+
+        outer = radius * 0.60
+        inner = radius * 0.25
+
+        for i in range(10):
+
+            angle = (
+                -math.pi / 2
+                + i * math.pi / 5
+            )
+
+            r = (
+                outer
+                if i % 2 == 0
+                else inner
+            )
+
+            points.append(
+                (
+                    cx + r * math.cos(angle),
+                    cy + r * math.sin(angle),
+                )
+            )
+
+        draw.polygon(
+            points,
+            fill=WHITE,
+        )
+
+
+    def draw_overflow(
+        self,
+        canvas,
+        cx,
+        cy,
+        radius,
+    ):
+
+        self.icon_circle(
+            canvas,
+            cx,
+            cy,
+            radius,
+        )
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        dot = S(3)
+
+        for dy in (
+            -radius * 0.36,
+            0,
+            radius * 0.36,
+        ):
+
+            draw.ellipse(
+                (
+                    cx - dot,
+                    cy + dy - dot,
+                    cx + dot,
+                    cy + dy + dot,
+                ),
+                fill=WHITE,
+            )
+
+
+    # ========================================================
+    # SEEK BAR
+    # ========================================================
+
+    def draw_seekbar(
+        self,
+        canvas,
+        fraction,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        fraction = max(
+            0.0,
+            min(1.0, fraction),
+        )
+
+        x0 = RIGHT_X
+        x1 = RIGHT_X_END
+        y = SEEK_Y
+
+        thickness = S(9)
+
+        fx = (
+            x0
+            + (x1 - x0) * fraction
+        )
+
+        draw.rounded_rectangle(
+            (
+                x0,
+                y - thickness / 2,
+                x1,
+                y + thickness / 2,
+            ),
+            radius=thickness // 2,
+            fill=(255, 255, 255, 145),
+        )
+
+        draw.ellipse(
+            (
+                fx - SEEK_THUMB_R,
+                y - SEEK_THUMB_R,
+                fx + SEEK_THUMB_R,
+                y + SEEK_THUMB_R,
+            ),
+            fill=(255, 255, 255, 245),
+        )
+
+
+    # ========================================================
+    # BOT NAME PILL
+    # ========================================================
+
+    def draw_time_row(
+        self,
+        canvas,
+        elapsed,
+        remaining,
+        bot_name,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        if elapsed:
+            draw.text(
+                (
+                    RIGHT_X,
+                    TIME_Y,
+                ),
+                elapsed,
+                font=self.font_time,
+                fill=SUBTITLE_COLOR,
+                anchor="lm",
+            )
+
+        if remaining:
+            draw.text(
+                (
+                    RIGHT_X_END,
+                    TIME_Y,
+                ),
+                remaining,
+                font=self.font_time,
+                fill=SUBTITLE_COLOR,
+                anchor="rm",
+            )
+
+        label = self.truncate(
+            bot_name or "Music Bot",
+            22,
+        )
+
+        font = self.font_pill
+
+        box = draw.textbbox(
+            (0, 0),
+            label,
+            font=font,
+        )
+
+        text_width = (
+            box[2] - box[0]
+        )
+
+        padding = S(16)
+
+        pill_width = (
+            text_width
+            + padding * 2
+        )
+
+        max_width = S(260)
+
+        if pill_width > max_width:
+
+            label = self.truncate(
+                label,
+                16,
+            )
+
+            box = draw.textbbox(
+                (0, 0),
+                label,
+                font=font,
+            )
+
+            text_width = (
+                box[2] - box[0]
+            )
+
+            pill_width = (
+                text_width
+                + padding * 2
+            )
+
+        px0 = (
+            PILL_CX
+            - pill_width / 2
+        )
+
+        px1 = (
+            PILL_CX
+            + pill_width / 2
+        )
+
+        py0 = (
+            TIME_Y
+            - PILL_H / 2
+        )
+
+        py1 = (
+            TIME_Y
+            + PILL_H / 2
+        )
+
+        draw.rounded_rectangle(
+            (
+                px0,
+                py0,
+                px1,
+                py1,
+            ),
+            radius=PILL_H // 2,
+            fill=(35, 33, 32, 180),
+            outline=(255, 255, 255, 65),
+            width=S(1),
+        )
+
+        draw.text(
+            (
+                PILL_CX,
+                TIME_Y,
+            ),
+            label,
+            font=font,
+            fill=WHITE,
+            anchor="mm",
+        )
+
+
+    # ========================================================
+    # PLAY / SKIP CONTROLS
+    # ========================================================
+
+    def draw_controls(
+        self,
+        canvas,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        y = CONTROLS_Y
+
+        # Pause
+        bar_w = S(17)
+        bar_h = S(65)
+        gap = S(19)
+
+        for dx in (
+            -gap / 2 - bar_w / 2,
+            gap / 2 + bar_w / 2,
+        ):
+
+            draw.rounded_rectangle(
+                (
+                    PLAY_CX + dx - bar_w / 2,
+                    y - bar_h / 2,
+                    PLAY_CX + dx + bar_w / 2,
+                    y + bar_h / 2,
+                ),
+                radius=bar_w // 3,
+                fill=WHITE,
+            )
+
+        # Skip buttons
+        tri_w = S(28)
+        tri_h = S(42)
+        gap = S(6)
+
+        for cx, direction in (
+            (REWIND_X, -1),
+            (FORWARD_X, 1),
+        ):
+
+            for i in (0, 1):
+
+                offset = (
+                    i - 0.5
+                ) * (
+                    tri_w + gap
+                ) * direction
+
+                if direction > 0:
+
+                    points = [
+                        (
+                            cx + offset - tri_w / 2,
+                            y - tri_h / 2,
+                        ),
+                        (
+                            cx + offset - tri_w / 2,
+                            y + tri_h / 2,
+                        ),
+                        (
+                            cx + offset + tri_w / 2,
+                            y,
+                        ),
+                    ]
+
+                else:
+
+                    points = [
+                        (
+                            cx + offset + tri_w / 2,
+                            y - tri_h / 2,
+                        ),
+                        (
+                            cx + offset + tri_w / 2,
+                            y + tri_h / 2,
+                        ),
+                        (
+                            cx + offset - tri_w / 2,
+                            y,
+                        ),
+                    ]
+
+                draw.polygon(
+                    points,
+                    fill=WHITE,
+                )
+
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    def draw_volume(
+        self,
+        canvas,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        y = VOLUME_Y
+
+        thickness = S(9)
+
+        draw.rounded_rectangle(
+            (
+                VOL_BAR_X0,
+                y - thickness / 2,
+                VOL_BAR_X1,
+                y + thickness / 2,
+            ),
+            radius=thickness // 2,
+            fill=(255, 255, 255, 230),
+        )
+
+        # Left speaker
+        cx = VOL_SPEAKER_LOW_X
+
+        body_w = S(9)
+        body_h = S(12)
+        cone = S(11)
+
+        draw.rectangle(
+            (
+                cx - body_w,
+                y - body_h / 2,
+                cx,
+                y + body_h / 2,
+            ),
+            fill=WHITE,
+        )
+
+        draw.polygon(
+            [
+                (
+                    cx,
+                    y - body_h / 2,
+                ),
+                (
+                    cx,
+                    y + body_h / 2,
+                ),
+                (
+                    cx + cone,
+                    y + body_h / 2 + cone * 0.6,
+                ),
+                (
+                    cx + cone,
+                    y - body_h / 2 - cone * 0.6,
+                ),
+            ],
+            fill=WHITE,
+        )
+
+        # Right speaker
+        cx = VOL_SPEAKER_HIGH_X
+
+        draw.rectangle(
+            (
+                cx - body_w,
+                y - body_h / 2,
+                cx,
+                y + body_h / 2,
+            ),
+            fill=WHITE,
+        )
+
+        draw.polygon(
+            [
+                (
+                    cx,
+                    y - body_h / 2,
+                ),
+                (
+                    cx,
+                    y + body_h / 2,
+                ),
+                (
+                    cx + cone,
+                    y + body_h / 2 + cone * 0.6,
+                ),
+                (
+                    cx + cone,
+                    y - body_h / 2 - cone * 0.6,
+                ),
+            ],
+            fill=WHITE,
+        )
+
+        for radius in (
+            S(10),
+            S(16),
+        ):
+
+            draw.arc(
+                (
+                    cx + cone - radius,
+                    y - radius,
+                    cx + cone + radius,
+                    y + radius,
+                ),
+                -40,
+                40,
+                fill=WHITE,
+                width=S(2),
+            )
+
+
+    # ========================================================
+    # BOTTOM ICONS
+    # ========================================================
+
+    def draw_bottom_icons(
+        self,
+        canvas,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        y = BOTTOM_ICON_Y
+
+        # Quote icon
+        cx = BOTTOM_ICON1_X
+
+        width = S(34)
+        height = S(24)
+
+        draw.rounded_rectangle(
+            (
+                cx - width / 2,
+                y - height / 2,
+                cx + width / 2,
+                y + height / 2,
+            ),
+            radius=S(6),
+            outline=MUTED,
+            width=S(2),
+        )
+
+        font = self.font_pill
+
+        draw.text(
+            (
+                cx,
+                y,
+            ),
+            '"',
+            font=font,
+            fill=MUTED,
+            anchor="mm",
+        )
+
+        # Queue
+        cx = BOTTOM_ICON3_X
+
+        for dy in (
+            -S(9),
+            0,
+            S(9),
+        ):
+
+            dot = S(2)
+
+            x0 = (
+                cx
+                - S(15)
+            )
+
+            draw.ellipse(
+                (
+                    x0 - dot,
+                    y + dy - dot,
+                    x0 + dot,
+                    y + dy + dot,
+                ),
+                fill=MUTED,
+            )
+
+            draw.line(
+                (
+                    x0 + S(8),
+                    y + dy,
+                    x0 + S(34),
+                    y + dy,
+                ),
+                fill=MUTED,
+                width=S(2),
+            )
+
+
+    # ========================================================
+    # RIGHT PANEL
+    # ========================================================
+
+    def draw_now_playing(
+        self,
+        canvas,
+        title,
+        channel,
+        bot_name,
+        duration,
+    ):
+
+        draw = ImageDraw.Draw(
+            canvas,
+            "RGBA",
+        )
+
+        max_title_width = (
+            STAR_ICON_X
+            - TOP_ICON_R
+            - RIGHT_X
+            - S(24)
+        )
+
+        title = unidecode(
+            str(title or "Unknown Title")
+        )
+
+        title, title_font = self.fit_title(
+            draw,
+            title,
+            max_title_width,
+        )
+
+        draw.text(
+            (
+                RIGHT_X,
+                TITLE_Y,
+            ),
+            title,
+            font=title_font,
+            fill=TITLE_COLOR,
+        )
+
+        channel = unidecode(
+            str(channel or "Unknown Artist")
+        )
+
+        draw.text(
+            (
+                RIGHT_X,
+                SUBTITLE_Y,
+            ),
+            self.truncate(
+                channel,
+                34,
+            ),
+            font=self.font_subtitle,
+            fill=SUBTITLE_COLOR,
+        )
+
+        # Icons
+        self.draw_star(
+            canvas,
+            STAR_ICON_X,
+            TOP_ICON_Y,
+            TOP_ICON_R,
+        )
+
+        self.draw_overflow(
+            canvas,
+            DOTS_ICON_X,
+            TOP_ICON_Y,
+            TOP_ICON_R,
+        )
+
+        # Duration
+        total = self.parse_duration(
+            duration
+        )
+
+        elapsed_seconds = 3
+
+        if total and total > 0:
+
+            fraction = max(
+                0,
+                min(
+                    1,
+                    elapsed_seconds / total,
+                ),
+            )
+
+            remaining = max(
+                0,
+                total - elapsed_seconds,
+            )
+
+            remaining_text = (
+                "-"
+                + self.format_time(
+                    remaining
+                )
+            )
+
+        else:
+
+            fraction = 0.02
+            remaining_text = None
+
+        self.draw_seekbar(
+            canvas,
+            fraction,
+        )
+
+        self.draw_time_row(
+            canvas,
+            self.format_time(
+                elapsed_seconds
+            ),
+            remaining_text,
+            bot_name,
+        )
+
+        self.draw_controls(
+            canvas
+        )
+
+        self.draw_volume(
+            canvas
+        )
+
+        self.draw_bottom_icons(
+            canvas
+        )
+
+
+    # ========================================================
+    # FINAL COMPOSE
+    # ========================================================
+
+    def compose(
+        self,
+        cover,
+        title,
+        channel,
+        bot_name,
+        duration=None,
+    ):
+
+        cover = cover.convert("RGB")
+
+        accent = self.get_accent(
+            cover
+        )
+
+        canvas = self.build_background(
+            cover
+        )
+
+        self.draw_poster_card(
+            canvas,
+            cover,
+            accent,
+        )
+
+        self.draw_now_playing(
+            canvas,
+            title,
+            channel,
+            bot_name,
+            duration,
+        )
+
+        # Very subtle grain
+        grain = Image.new(
+            "RGBA",
+            FINAL_SIZE,
+            (128, 128, 128, 5),
+        )
+
+        canvas.alpha_composite(
+            grain
+        )
+
+        result = canvas.convert(
+            "RGB"
+        )
+
+        canvas.close()
+        cover.close()
+
+        return result
+
+
+# ============================================================
+# SINGLE GLOBAL THUMBNAIL INSTANCE
+# ============================================================
+
+thumbnail_generator = Thumbnail()
+
+
+# ============================================================
+# MAIN FUNCTION
+# KEEPING FIRST CODE'S SAME API
+# ============================================================
+
+async def get_thumb(
+    videoid,
+    user_id,
+    title=None,
+    duration=None,
+    thumbnail=None,
+    views=None,
+    channel=None,
+):
+
+    cache_dir = "cache"
+
+    os.makedirs(
+        cache_dir,
+        exist_ok=True,
+    )
+
+    output_path = (
+        f"{cache_dir}/{videoid}_{user_id}.png"
+    )
+
+    # Existing cached thumbnail
+    if os.path.isfile(output_path):
+        return output_path
+
+    cover_path = (
+        f"{cache_dir}/thumb_{videoid}.jpg"
+    )
+
+    try:
+
+        # ====================================================
+        # FETCH YOUTUBE DETAILS
+        # ====================================================
+
+        if not title or not thumbnail:
+
+            url = (
+                f"https://www.youtube.com/watch?v={videoid}"
+            )
+
+            results = VideosSearch(
+                url,
+                limit=1,
+            )
+
+            data = await results.next()
+
+            items = data.get(
+                "result",
+                [],
+            )
+
+            if not items:
+                return YOUTUBE_IMG_URL
+
+            result = items[0]
+
+            try:
+                title = result.get(
+                    "title",
+                    "Unknown Title",
+                )
+            except Exception:
+                title = "Unknown Title"
+
+            try:
+                duration = result.get(
+                    "duration",
+                    "Unknown",
+                )
+            except Exception:
+                duration = "Unknown"
+
+            try:
+                thumbnail = result[
+                    "thumbnails"
+                ][0]["url"].split("?")[0]
+            except Exception:
+                thumbnail = YOUTUBE_IMG_URL
+
+            try:
+                channel = result[
+                    "channel"
+                ]["name"]
+            except Exception:
+                channel = "Unknown Artist"
+
+            try:
+                views = result[
+                    "viewCount"
+                ]["short"]
+            except Exception:
+                views = "Unknown Views"
+
+        else:
+
+            title = str(
+                title or "Unknown Title"
+            )
+
+            duration = (
+                duration
+                or "Unknown"
+            )
+
+            channel = (
+                channel
+                or "Unknown Artist"
+            )
+
+        # ====================================================
+        # DOWNLOAD COVER
+        # ====================================================
+
+        try:
+
+            await download_file(
+                thumbnail,
+                cover_path,
+            )
+
+        except Exception:
+
+            # If supplied thumbnail fails,
+            # try YouTube default image.
+            if thumbnail != YOUTUBE_IMG_URL:
+
+                try:
+                    await download_file(
+                        YOUTUBE_IMG_URL,
+                        cover_path,
+                    )
+                except Exception:
+                    return YOUTUBE_IMG_URL
+
+            else:
+                return YOUTUBE_IMG_URL
+
+        # ====================================================
+        # LOAD COVER
+        # ====================================================
+
+        cover = await asyncio.to_thread(
+            load_image,
+            cover_path,
+        )
+
+        if cover is None:
+            return YOUTUBE_IMG_URL
+
+        # ====================================================
+        # BOT NAME
+        # ====================================================
+
+        try:
+            bot_name = unidecode(
+                str(
+                    app.name
+                    or "Music Bot"
+                )
+            )
+        except Exception:
+            bot_name = "Music Bot"
+
+        # ====================================================
+        # GENERATE 1920x1080 THUMBNAIL
+        # ====================================================
+
+        final_image = await asyncio.to_thread(
+            thumbnail_generator.compose,
+            cover,
+            title,
+            channel,
+            bot_name,
+            duration,
+        )
+
+        # ====================================================
+        # SAVE
+        # ====================================================
+
+        await asyncio.to_thread(
+            final_image.save,
+            output_path,
+            "PNG",
+            optimize=True,
+        )
+
+        try:
+            final_image.close()
+        except Exception:
+            pass
+
+        try:
+            cover.close()
+        except Exception:
+            pass
+
+        return output_path
+
+    except Exception as e:
+
+        print(
+            f"[Thumbnail Error] {type(e).__name__}: {e}"
+        )
+
         return YOUTUBE_IMG_URL
+
+    finally:
+
+        try:
+            if os.path.exists(cover_path):
+                os.remove(cover_path)
+        except Exception:
+            pass
