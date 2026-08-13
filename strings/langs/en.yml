@@ -174,8 +174,8 @@ queue_6 : "<b>🕚 Dᴜʀᴀᴛɪᴏɴ : Uɴᴋɴᴏᴡɴ Dᴜʀᴀᴛɪᴏɴ S�
 queue_7 : "<b>Cʟɪᴄᴋ Oɴ Bᴜᴛᴛᴏɴ Bᴇʟᴏᴡ Tᴏ Gᴇᴛ Wʜᴏʟᴇ Qᴜᴇᴜᴇᴅ Lɪsᴛ.</b>"
 queue_8 : "<b>{0} Pʟᴀʏᴇʀ\n\n❄ Sᴛʀᴇᴀᴍɪɴɢ : {1}\n\n🔗 Sᴛʀᴇᴀᴍ Tʏᴘᴇ : {2}\n🥀 Rᴇǫᴜᴇsᴛᴇᴅ Bʏ : {3}\n{4}</b>"
 
-stream_1 : "<b>➻ Sᴛᴀʀᴛᴇᴅ Sᴛʀᴇᴀᴍɪɴɢ |\n\n✨ Tɪᴛʟᴇ : <a href={0}>{1}</a>\n⏱ Dᴜʀᴀᴛɪᴏɴ : {2} Mɪɴᴜᴛᴇs\n🥀 Rᴇǫᴜᴇsᴛᴇᴅ Bʏ : {3}</b>"
-stream_2 : "<b>➻ Sᴛᴀʀᴛᴇᴅ Sᴛʀᴇᴀᴍɪɴɢ |\n\n✨ Sᴛʀᴇᴀᴍ Tʏᴘᴇ : Lɪᴠᴇ Sᴛʀᴇᴀᴍ [Uʀʟ]\n🥀 Rᴇǫᴜᴇsᴛᴇᴅ Bʏ : {0}</b>"
+stream_1 : "<blockquote>▣ 𝗦𝘁𝗿𝗲𝗮𝗺𝗶𝗻𝗴</blockquote>\n<blockquote>\n\n<b>▣ Tɪᴛʟᴇ :</b> <a href={0}>{1}</a>\n<b>▣ Dᴜʀᴀᴛɪᴏɴ :</b> {2} Mɪɴᴜᴛᴇs\n<b>▣ Rᴇǫᴜᴇsᴛᴇᴅ Bʏ :</b> {3}\n\n</blockquote>\n"
+stream_2 : "<blockquote>▣ 𝗦𝘁𝗿𝗲𝗮𝗺𝗶𝗻𝗴</blockquote>\n<blockquote>\n━━━━━━━━━━━━━━━━━━━━━━━━\n<b>▣ Tɪᴛʟᴇ :</b> <a href={0}>{1}</a>\n<b>▣ Dᴜʀᴀᴛɪᴏɴ :</b> {2} Mɪɴᴜᴛᴇs\n<b>▣ Rᴇǫᴜᴇsᴛᴇᴅ Bʏ :</b> {3}\n━━━━━━━━━━━━━━━━━━━━━━━━\n</blockquote>\n"
 
 
 CLOSE_BUTTON : "Cʟᴏsᴇ"
